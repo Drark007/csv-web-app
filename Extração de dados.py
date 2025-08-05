@@ -3,21 +3,23 @@ import pandas as pd
 import io
 from datetime import datetime
 import chardet
+import numpy as np
 
 st.set_page_config(page_title="Extração de dados CSV", layout="wide")
 st.title("🔍 Extração de Dados CSV")
 
 st.markdown("""
-Esta aplicação permite extrair colunas específicas de múltiplos arquivos CSV com estrutura idêntica,
-com suporte à conversão de unidades, verificação de colunas e exportação para Excel.
+Esta aplicação permite extrair colunas específicas de múltiplos arquivos CSV com estrutura idêntica ou diferente,
+com suporte à verificação de estrutura, conversão de unidades, visualização prévia, exportação para Excel
+em abas organizadas por estrutura.
 """)
 
 uploaded_files = st.file_uploader("Selecione um ou mais arquivos CSV", accept_multiple_files=True, type="csv")
 
 if uploaded_files:
-    colunas_iguais = True
-    nomes_colunas = None
-    arquivos, nomes_arquivos, erro_decodificacao = [], [], []
+    grupos = {}
+    arquivos_info = []
+    erro_decodificacao = []
 
     for arquivo in uploaded_files:
         content = arquivo.read()
@@ -31,66 +33,105 @@ if uploaded_files:
             erro_decodificacao.append(arquivo.name)
             continue
 
-        arquivos.append(df)
-        nomes_arquivos.append(arquivo.name)
-
-        if nomes_colunas is None:
-            nomes_colunas = list(df.columns)
-        elif list(df.columns) != nomes_colunas:
-            colunas_iguais = False
-            break
+        estrutura = tuple(df.columns)
+        if estrutura not in grupos:
+            grupos[estrutura] = []
+        grupos[estrutura].append((arquivo.name, df))
+        arquivos_info.append((arquivo.name, df, estrutura))
 
     if erro_decodificacao:
         st.warning(f"Arquivos não lidos: {', '.join(erro_decodificacao)}")
 
-    if not arquivos:
+    if not arquivos_info:
         st.stop()
 
-    if not colunas_iguais:
-        st.error("Os arquivos não possuem a mesma estrutura de colunas.")
-    else:
-        st.success("Estrutura de colunas idêntica confirmada.")
-        st.write("**Arquivos carregados:**", nomes_arquivos)
+    st.success(f"{len(grupos)} estrutura(s) distinta(s) detectada(s).")
+    st.write("**Arquivos agrupados por estrutura:**")
+    for i, (estrutura, arquivos) in enumerate(grupos.items(), start=1):
+        st.markdown(f"**Estrutura {i}**: {len(arquivos)} arquivo(s) - Colunas: {list(estrutura)}")
 
-        colunas_escolhidas = st.multiselect("Selecione as colunas a extrair", nomes_colunas)
-        converter_volume = st.checkbox("Converter volumes de µL para mL")
-        remover_duplicatas = st.checkbox("Remover linhas duplicadas")
+    estrutura_alertas = []
+    for i, (estrutura, arquivos) in enumerate(grupos.items(), start=1):
+        alerta = []
+        for col in estrutura:
+            if "ph" in col.lower():
+                alerta.append("pH")
+            if "temp" in col.lower():
+                alerta.append("Temperatura")
+            if "press" in col.lower():
+                alerta.append("Pressão")
+            if "vol" in col.lower() or "volume" in col.lower():
+                alerta.append("Volume")
+        if alerta:
+            estrutura_alertas.append(f"Estrutura {i} pode conter dados de: {', '.join(set(alerta))}")
 
-        if colunas_escolhidas:
-            if st.button("Gerar arquivo Excel"):
-                with st.spinner("Processando..."):
-                    excel_buffer = io.BytesIO()
-                    writer = pd.ExcelWriter(excel_buffer, engine='openpyxl')
-                    planilha = pd.DataFrame()
+    if estrutura_alertas:
+        with st.expander("⚠️ Alertas detectados nas estruturas"):
+            for msg in estrutura_alertas:
+                st.info(msg)
 
-                    for idx, df in enumerate(arquivos, start=1):
-                        dados = df[colunas_escolhidas].copy()
+    converter_dados = {}
+    for i, estrutura in enumerate(grupos.keys(), start=1):
+        converter_dados[estrutura] = {}
+        st.markdown(f"### Estrutura {i} – Definir unidades e conversões")
+        for col in estrutura:
+            unidade = st.selectbox(f"Coluna '{col}': Qual a unidade?", ["Não definido", "µL", "mL", "L", "°C", "K", "nm", "µm", "Hz", "kHz"], key=f"unidade_{i}_{col}")
+            if unidade != "Não definido":
+                alvo = st.selectbox(f"Converter '{col}' para:", ["Não converter", "µL", "mL", "L", "°C", "K", "nm", "µm", "Hz", "kHz"], key=f"converter_{i}_{col}")
+                if alvo != "Não converter" and alvo != unidade:
+                    converter_dados[estrutura][col] = (unidade, alvo)
 
-                        for col in dados.columns:
-                            if "vol" in col.lower() and converter_volume:
-                                dados[col] = pd.to_numeric(dados[col], errors='coerce') / 1000
+    gerar_excel = st.button("Gerar arquivo Excel")
 
-                            if "pH" in col:
-                                st.info(f"Atenção: coluna '{col}' pode conter dados de pH.")
+    if gerar_excel:
+        with st.spinner("Processando..."):
+            excel_buffer = io.BytesIO()
+            writer = pd.ExcelWriter(excel_buffer, engine='openpyxl')
 
-                        if remover_duplicatas:
-                            dados = dados.drop_duplicates()
+            for idx, (estrutura, arquivos) in enumerate(grupos.items(), start=1):
+                planilha = pd.DataFrame()
+                blocos = []
+                for nome, df in arquivos:
+                    dados = df.copy()
+                    for col in dados.columns:
+                        if col in converter_dados[estrutura]:
+                            origem, destino = converter_dados[estrutura][col]
+                            try:
+                                dados[col] = pd.to_numeric(dados[col], errors='coerce')
+                                if origem == "µL" and destino == "mL":
+                                    dados[col] = dados[col] / 1000
+                                elif origem == "mL" and destino == "µL":
+                                    dados[col] = dados[col] * 1000
+                                elif origem == "mL" and destino == "L":
+                                    dados[col] = dados[col] / 1000
+                                elif origem == "°C" and destino == "K":
+                                    dados[col] = dados[col] + 273.15
+                                elif origem == "K" and destino == "°C":
+                                    dados[col] = dados[col] - 273.15
+                                elif origem == "nm" and destino == "µm":
+                                    dados[col] = dados[col] / 1000
+                                elif origem == "µm" and destino == "nm":
+                                    dados[col] = dados[col] * 1000
+                                elif origem == "Hz" and destino == "kHz":
+                                    dados[col] = dados[col] / 1000
+                                elif origem == "kHz" and destino == "Hz":
+                                    dados[col] = dados[col] * 1000
+                            except Exception:
+                                pass
+                    dados.columns = [f"{col} ({nome})" for col in dados.columns]
+                    blocos.append(dados)
+                    blocos.append(pd.DataFrame(np.nan, index=range(len(dados)), columns=[""]))
 
-                        nome_grupo = f"Documento {idx}"
-                        header = pd.DataFrame({col: [nome_grupo] if i == 0 else [None] for i, col in enumerate(colunas_escolhidas)})
-                        planilha = pd.concat([planilha, header, dados, pd.DataFrame([[]])], ignore_index=True)
+                final = pd.concat(blocos, axis=1)
+                final.to_excel(writer, index=False, sheet_name=f"Estrutura {idx}")
 
-                    planilha.columns = colunas_escolhidas
-                    planilha.to_excel(writer, index=False, sheet_name="Dados")
-                    writer.close()
+            writer.close()
 
-                    nome_arquivo = datetime.now().strftime("%Y_%m_%d") + "_extracao.xlsx"
-                    st.download_button(
-                        label="📥 Baixar Excel",
-                        data=excel_buffer.getvalue(),
-                        file_name=nome_arquivo,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                    st.success("Arquivo gerado com sucesso.")
-        else:
-            st.info("Selecione pelo menos uma coluna.")
+            nome_arquivo = datetime.now().strftime("%Y_%m_%d") + "_extracao_completa.xlsx"
+            st.download_button(
+                label="📥 Baixar Excel",
+                data=excel_buffer.getvalue(),
+                file_name=nome_arquivo,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            st.success("Arquivo Excel gerado com sucesso.")
